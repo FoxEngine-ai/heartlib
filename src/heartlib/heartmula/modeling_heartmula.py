@@ -152,16 +152,39 @@ class HeartMuLa(PreTrainedModel):
         self.muq_linear = nn.Linear(config.muq_dim, backbone_dim)
         self.post_init()
 
+    def compile_model(self, mode: str = "reduce-overhead", cache_dir: str = None):
+        """Compile backbone and decoder with torch.compile for faster inference."""
+        import os
+        import torch._dynamo
+        import torch._inductor.config as inductor_config
+
+        if cache_dir is not None:
+            os.makedirs(cache_dir, exist_ok=True)
+            abs_cache_dir = os.path.abspath(cache_dir)
+            # Set cache directory
+            os.environ["TORCHINDUCTOR_CACHE_DIR"] = abs_cache_dir
+            # Enable FX graph caching (required to actually reuse cached compilations)
+            inductor_config.fx_graph_cache = True
+            # Increase dynamo cache size to avoid eviction
+            torch._dynamo.config.cache_size_limit = 256
+            print(f"[Compile] Using cache directory: {abs_cache_dir}")
+            print(f"[Compile] FX graph cache enabled: {inductor_config.fx_graph_cache}")
+
+        print(f"[Compile] Compiling backbone and decoder with mode={mode}")
+        self.backbone = torch.compile(self.backbone, mode=mode)
+        self.decoder = torch.compile(self.decoder, mode=mode)
+
     def setup_caches(self, max_batch_size: int):
-        dtype = next(self.parameters()).dtype
-        device = next(self.parameters()).device
-
-        try:
+        # Skip if caches already set up (for server reuse)
+        if self.backbone.caches_are_enabled():
             self.reset_caches()
-        except RuntimeError:
-            pass
+            return
 
-        with device:
+        dtype = next(self.parameters()).dtype
+        param = next(self.parameters())
+        device = param.device
+
+        with torch.device(device):
             self.backbone.setup_caches(max_batch_size, dtype)
             self.decoder.setup_caches(
                 max_batch_size,

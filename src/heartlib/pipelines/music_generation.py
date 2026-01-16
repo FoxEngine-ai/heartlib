@@ -54,6 +54,7 @@ class HeartMuLaGenPipeline(Pipeline):
             "temperature": kwargs.get("temperature", 1.0),
             "topk": kwargs.get("topk", 50),
             "cfg_scale": kwargs.get("cfg_scale", 1.5),
+            "progress_callback": kwargs.get("progress_callback", None),
         }
         postprocess_kwargs = {
             "save_path": kwargs.get("save_path", "output.mp3"),
@@ -87,7 +88,7 @@ class HeartMuLaGenPipeline(Pipeline):
         if ref_audio is not None:
             raise NotImplementedError("ref_audio is not supported yet.")
         muq_embed = torch.zeros([self._muq_dim], dtype=self.dtype)
-        muq_idx = len(tags)
+        muq_idx = len(tags_ids)  # Use token count, not character count
 
         # process lyrics
         lyrics = inputs["lyrics"]
@@ -138,6 +139,7 @@ class HeartMuLaGenPipeline(Pipeline):
         temperature: float,
         topk: int,
         cfg_scale: float,
+        progress_callback: Optional[callable] = None,
     ):
         prompt_tokens = model_inputs["tokens"]
         prompt_tokens_mask = model_inputs["tokens_mask"]
@@ -148,7 +150,16 @@ class HeartMuLaGenPipeline(Pipeline):
         frames = []
 
         bs_size = 2 if cfg_scale != 1.0 else 1
+
+        def _print_vram(label: str):
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"[VRAM] {label}: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+
+        _print_vram("Before setup_caches")
         self.model.setup_caches(bs_size)
+        _print_vram("After setup_caches")
         with torch.autocast(device_type=self.device.type, dtype=self.dtype):
             curr_token = self.model.generate_frame(
                 tokens=prompt_tokens,
@@ -195,8 +206,12 @@ class HeartMuLaGenPipeline(Pipeline):
                     starts=None,
                 )
             if torch.any(curr_token[0:1, :] >= self.config.audio_eos_id):
+                if progress_callback:
+                    progress_callback(i + 1, max_audio_frames, len(frames), True)
                 break
             frames.append(curr_token[0:1,])
+            if progress_callback:
+                progress_callback(i + 1, max_audio_frames, len(frames), False)
         frames = torch.stack(frames).permute(1, 2, 0).squeeze(0)
         wav = self.audio_codec.detokenize(frames)
         return {"wav": wav}
@@ -213,12 +228,31 @@ class HeartMuLaGenPipeline(Pipeline):
         dtype: torch.dtype,
         version: str,
         bnb_config: Optional[BitsAndBytesConfig] = None,
+        compile: bool = False,
+        compile_mode: str = "reduce-overhead",
+        compile_cache_dir: Optional[str] = None,
     ):
+        def _print_vram(label: str):
+            if torch.cuda.is_available():
+                allocated = torch.cuda.memory_allocated() / 1024**3
+                reserved = torch.cuda.memory_reserved() / 1024**3
+                print(f"[VRAM] {label}: {allocated:.2f} GB allocated, {reserved:.2f} GB reserved")
+
+        quant_str = "none"
+        if bnb_config is not None:
+            if getattr(bnb_config, "load_in_4bit", False):
+                quant_str = "4bit"
+            elif getattr(bnb_config, "load_in_8bit", False):
+                quant_str = "8bit"
+
+        _print_vram("Before loading")
 
         if os.path.exists(
             heartcodec_path := os.path.join(pretrained_path, "HeartCodec-oss")
         ):
+            print(f"[Loading] HeartCodec from {heartcodec_path}")
             heartcodec = HeartCodec.from_pretrained(heartcodec_path, device_map=device)
+            _print_vram("After HeartCodec")
         else:
             raise FileNotFoundError(
                 f"Expected to find checkpoint for HeartCodec at {heartcodec_path} but not found. Please check your folder {pretrained_path}."
@@ -227,9 +261,19 @@ class HeartMuLaGenPipeline(Pipeline):
         if os.path.exists(
             heartmula_path := os.path.join(pretrained_path, f"HeartMuLa-oss-{version}")
         ):
+            print(f"[Loading] HeartMuLa-{version} from {heartmula_path} (dtype={dtype}, quantization={quant_str})")
             heartmula = HeartMuLa.from_pretrained(
-                heartmula_path, dtype=dtype, quantization_config=bnb_config
+                heartmula_path, dtype=dtype, quantization_config=bnb_config,
             )
+            _print_vram("After HeartMuLa load")
+            # Move to GPU
+            heartmula = heartmula.to(device)
+            _print_vram("After HeartMuLa to GPU")
+            # Check device
+            sample_param = next(heartmula.backbone.parameters())
+            print(f"[Info] Backbone param dtype: {sample_param.dtype}, device: {sample_param.device}")
+            if compile:
+                heartmula.compile_model(mode=compile_mode, cache_dir=compile_cache_dir)
         else:
             raise FileNotFoundError(
                 f"Expected to find checkpoint for HeartMuLa at {heartmula_path} but not found. Please check your folder {pretrained_path}."
